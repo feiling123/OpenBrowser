@@ -287,11 +287,22 @@ jobs:
           PACKAGE_STEM="OpenBrowser-Windows-x86_64-with-kernel"
           APP="dist/${PACKAGE_STEM}/runtime/resources/app"
           test -d "$APP/bundled-kernels/wayfern"
-          test -f "dist/${PACKAGE_STEM}.exe"
           test -f "dist/${PACKAGE_STEM}.zip"
+          # No .exe is expected here: the bundled Wayfern kernel unpacks to
+          # ~1.9 GiB, past the ~2 GiB ceiling where makensis fails with
+          # "error mmapping datablock". This variant ships as the ZIP; the
+          # kernel-free variant still gets a normal NSIS installer.
+          if [ -f "dist/${PACKAGE_STEM}.exe" ]; then
+            echo "note: NSIS installer was produced as well; publishing both."
+          fi
       - name: Upload package to release
         shell: bash
-        run: bash scripts/publish-release.sh "$RELEASE_TAG" "$RUNNER_TEMP/openbrowser-release-notes.md" "dist/OpenBrowser-Windows-x86_64-with-kernel.exe" "dist/OpenBrowser-Windows-x86_64-with-kernel.zip"
+        run: |
+          set -euo pipefail
+          PACKAGE_STEM="OpenBrowser-Windows-x86_64-with-kernel"
+          ASSETS=("dist/${PACKAGE_STEM}.zip")
+          [ -f "dist/${PACKAGE_STEM}.exe" ] && ASSETS+=("dist/${PACKAGE_STEM}.exe")
+          bash scripts/publish-release.sh "$RELEASE_TAG" "$RUNNER_TEMP/openbrowser-release-notes.md" "${ASSETS[@]}"
 
   windows-x86_64-without-kernel:
     name: Windows x86_64 without bundled kernel

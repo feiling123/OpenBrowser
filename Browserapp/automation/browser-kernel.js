@@ -121,6 +121,20 @@ async function preflightArchiveMembers(archivePath, kind) {
   }
 }
 
+/**
+ * Reject an extracted kernel tree that could escape its own directory.
+ *
+ * The security property is: no link may resolve outside `root`. A link that
+ * stays inside is safe even when its target does not exist yet — macOS .app
+ * bundles legitimately ship such links (Versions/Current -> <version>, and the
+ * framework's Helpers/Libraries/Resources -> Versions/Current/...), and a copy
+ * step can momentarily leave one dangling. Judging those by realpath alone
+ * rejects a valid bundle, so fall back to resolving the link lexically.
+ *
+ * Errors name the offending path and target: "contains an unsafe link" with no
+ * further detail is undiagnosable in CI, where the tree is gone by the time
+ * anyone reads the log.
+ */
 async function assertSafeExtractedTree(root) {
   const base = await fsp.realpath(root);
   const stack = [base];
@@ -134,12 +148,24 @@ async function assertSafeExtractedTree(root) {
       const full = path.join(dir, entry.name);
       const stat = await fsp.lstat(full);
       if (stat.isSymbolicLink()) {
-        const target = await fsp.realpath(full).catch(() => null);
-        if (!target || !isPathInsideRoot(target, base)) throw new Error('Extracted kernel contains an unsafe link');
+        const rel = path.relative(base, full) || entry.name;
+        const link = await fsp.readlink(full).catch(() => null);
+        if (link === null) throw new Error(`Extracted kernel has an unreadable link: ${rel}`);
+        // Prefer realpath (follows the whole chain); fall back to a lexical
+        // resolve so a dangling but internal link is still judged on where it
+        // points rather than on whether the target exists yet.
+        const resolved = await fsp.realpath(full)
+          .catch(() => path.resolve(path.dirname(full), link));
+        if (!isPathInsideRoot(resolved, base)) {
+          throw new Error(
+            `Extracted kernel contains an unsafe link: ${rel} -> ${link}`
+            + ` (resolves to ${resolved}, outside ${base})`
+          );
+        }
         continue;
       }
       if (stat.isDirectory()) stack.push(full);
-      else if (!stat.isFile()) throw new Error('Extracted kernel contains a special file');
+      else if (!stat.isFile()) throw new Error(`Extracted kernel contains a special file: ${path.relative(base, full)}`);
     }
   }
 }
@@ -1301,5 +1327,6 @@ module.exports = {
   extractTarXz,
   extractTarGz,
   archiveKindFromUrl,
+  assertSafeExtractedTree,
   resolveWayfernBinary,
 };

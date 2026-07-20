@@ -192,7 +192,51 @@ function nsisGlob(value) {
   return nsisPath(path.join(value, '*'));
 }
 
+/** Total bytes of a directory tree, following the same entries NSIS would pack. */
+function directoryBytes(root) {
+  let total = 0;
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { continue; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) { stack.push(full); continue; }
+      try { total += fs.statSync(full).size; } catch (_) { /* ignore */ }
+    }
+  }
+  return total;
+}
+
+/**
+ * makensis cannot build past roughly 2 GiB: it memory-maps its datablock in a
+ * 32-bit address space and fails with "Internal compiler error #12345: error
+ * mmapping datablock". The bundled Wayfern kernel alone unpacks to ~1.9 GiB, so
+ * the with-kernel variant is over the line before the runtime is even counted.
+ *
+ * Stay well below the limit rather than at it — the datablock also holds the
+ * runtime, the app tree, and NSIS bookkeeping.
+ */
+const NSIS_PAYLOAD_LIMIT_BYTES = 1600 * 1024 * 1024;
+
 function packageWindowsInstaller(packageRoot) {
+  const payloadBytes = directoryBytes(packageRoot);
+  const payloadGiB = (payloadBytes / (1024 * 1024 * 1024)).toFixed(2);
+  if (payloadBytes > NSIS_PAYLOAD_LIMIT_BYTES) {
+    // Not a failure: the ZIP built above is the shippable artifact for this
+    // variant. Failing here would break a build whose output is already valid.
+    console.warn(
+      `[package] 跳过 NSIS 安装程序：负载 ${payloadGiB} GiB 超出 makensis 的 ~2 GiB 上限。`
+      + ' 该变体以便携版压缩包发布。'
+    );
+    console.warn(
+      `[package] skipping NSIS installer: ${payloadGiB} GiB payload exceeds the makensis ~2 GiB ceiling;`
+      + ' this variant ships as the portable ZIP instead.'
+    );
+    return null;
+  }
   const output = path.join(distRoot, `${packageArtifactStem()}.exe`);
   const script = path.join(distRoot, 'OpenBrowser-Windows-installer.nsi');
   const installSource = nsisGlob(packageRoot);
@@ -236,6 +280,7 @@ function packageWindowsInstaller(packageRoot) {
   removeIfExists(script);
   if (!fs.existsSync(output)) throw new Error('NSIS 未生成 Windows 安装程序：' + output);
   console.log('Windows 安装程序：' + output);
+  return output;
 }
 
 function ensureResolvedHostDist() {
