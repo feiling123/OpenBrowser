@@ -14,6 +14,7 @@
     "selftest:fonts": "node automation/font-fingerprint-selftest.js",
     "selftest:escapes": "node automation/injection-escape-selftest.js",
     "selftest:extract": "node automation/kernel-extract-safety-selftest.js",
+    "selftest:dns": "node automation/dns-leak-containment-selftest.js",
     "selftest:kernel": "node automation/kernel-policy-selftest.js",
     "selftest:startup": "node browser-startup-diagnostic-selftest.js",
     "selftest:cloud": "node automation/cloud-sync-security-selftest.js",

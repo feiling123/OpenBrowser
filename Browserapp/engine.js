@@ -2,6 +2,7 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const net = require('net');
 const { pathToFileURL } = require('url');
 const { spawn, execFileSync } = require('child_process');
 const cdp = require('./cdp');
@@ -1828,6 +1829,48 @@ class BrowserEngine {
       const existingBypass = args.findIndex((a) => a.startsWith('--proxy-bypass-list='));
       if (existingBypass >= 0) args[existingBypass] = args[existingBypass] + ';' + bypass;
       else args.push(`--proxy-bypass-list=${bypass}`);
+
+      // --- DNS leak containment ---------------------------------------------
+      // A proxied profile must never resolve a name outside the tunnel. Two
+      // separate paths do exactly that if left alone:
+      //
+      //  1) Secure DNS (DoH). Chromium opens its own HTTPS connection to the
+      //     DoH provider, which does not honour --proxy-server. Queries egress
+      //     from the provider's network (Cloudflare 1.1.1.1 answers from its
+      //     nearest anycast PoP), so leak tests report that PoP's country while
+      //     traffic still exits through the proxy.
+      //  2) The plain host resolver, used for prefetch and any direct fallback.
+      //
+      // Proxied navigation is unaffected by the resolver rule below: Chromium
+      // hands the hostname to the proxy and never resolves it locally. The rule
+      // only removes the paths that would bypass the tunnel.
+      //
+      // Deliberate trade-off: with direct resolution denied, a dead proxy fails
+      // closed — pages stop loading instead of silently leaking to the host DNS.
+      disabledFeatures.push('DnsOverHttps', 'AsyncDns');
+      args.push('--dns-prefetch-disable');
+
+      // Names that must still resolve locally, or the profile cannot start:
+      // the loopback start page / local API, and the proxy's own hostname.
+      const resolverExcludes = ['localhost', '127.0.0.1'];
+      try {
+        const proxyHost = new URL(proxy).hostname;
+        // An IP literal needs no resolution; a hostname does.
+        if (proxyHost && !net.isIP(proxyHost) && !resolverExcludes.includes(proxyHost)) {
+          resolverExcludes.push(proxyHost);
+        }
+      } catch (_) { /* direct:// and malformed values have no host */ }
+      if (profile.proxyMeta?.directBypass && profile.proxyMeta.bypassList) {
+        // Hosts the user routes around the proxy still need real DNS.
+        for (const entry of String(profile.proxyMeta.bypassList).split(/[\s,;]+/)) {
+          const host = entry.trim().replace(/^\*\./, '');
+          if (host && !resolverExcludes.includes(host)) resolverExcludes.push(host);
+        }
+      }
+      const resolverRule = ['MAP * ~NOTFOUND', ...resolverExcludes.map((h) => `EXCLUDE ${h}`)].join(' , ');
+      const existingResolver = args.findIndex((a) => a.startsWith('--host-resolver-rules='));
+      if (existingResolver >= 0) args[existingResolver] = args[existingResolver] + ' , ' + resolverRule;
+      else args.push(`--host-resolver-rules=${resolverRule}`);
     }
     // Startup URLs: do NOT put the OpenBrowser start page (or first custom URL) on the
     // CLI. The process would paint and run collectFingerprint before CDP inject.
