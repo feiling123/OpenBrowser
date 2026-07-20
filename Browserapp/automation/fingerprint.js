@@ -27,6 +27,13 @@ const {
   parseOsFromUa,
   OS_PRESETS,
 } = require('./user-agent');
+const {
+  createFontProfileFromSeed,
+  fontMetricMarkFromSeed,
+  normalizeFontName,
+  isGenericFamily,
+  FONT_POOLS,
+} = require('./fonts');
 
 function hashSeed(input) {
   return crypto.createHash('sha256').update(String(input || '')).digest();
@@ -499,6 +506,9 @@ function buildFingerprint(profile = {}) {
   const speechMode = mode('speech', ['real', 'noise', 'blocked'], privacy.speech === 'blocked' ? 'blocked' : (privacy.speech === 'noise' ? 'noise' : 'real'));
   const batteryMode = mode('battery', ['real', 'noise', 'blocked'], privacy.battery === 'blocked' ? 'blocked' : (privacy.battery === 'real' ? 'real' : 'noise'));
   const webgpuMode = mode('webgpu', ['real', 'blocked', 'webgl'], privacy.webgpu === 'blocked' ? 'blocked' : (privacy.webgpu === 'webgl' ? 'webgl' : 'real'));
+  // 'mask' = seeded font set + metric noise; 'noise' = metric noise only (all fonts visible);
+  // 'blocked' = generic families only, which is stealthy-looking but rare in the wild.
+  const fontMode = mode('fonts', ['real', 'mask', 'noise', 'blocked'], privacy.fonts === 'real' ? 'real' : (privacy.fonts === 'blocked' ? 'blocked' : (privacy.fonts === 'noise' ? 'noise' : 'mask')));
   const stability = resolveStabilityPolicy(privacy, {
     host: fpIn.stabilityHost || privacy.stabilityHost || profile.stabilityHost || '',
     mode: fpIn.stabilityMode || privacy.stabilityMode,
@@ -598,6 +608,20 @@ function buildFingerprint(profile = {}) {
     Array.isArray(fpIn.languages) ? fpIn.languages : languages,
     speechMode
   );
+
+  // Font set follows the UA-derived OS: a Windows UA must not report macOS fonts.
+  const fontProfile = createFontProfileFromSeed(seed, uaOs, {
+    ratio: Number.isFinite(Number(fpIn.fontRatio)) ? Number(fpIn.fontRatio) : undefined,
+    extra: Array.isArray(fpIn.fontsExtra) ? fpIn.fontsExtra : [],
+    exclude: Array.isArray(fpIn.fontsExclude) ? fpIn.fontsExclude : [],
+  });
+  // An explicit list overrides the seeded set entirely (UI "custom fonts" path).
+  const fontListOverride = Array.isArray(fpIn.fontList) && fpIn.fontList.length
+    ? fpIn.fontList.map((name) => String(name || '').trim()).filter(Boolean)
+    : null;
+  const fontMetricMark = Number.isFinite(Number(fpIn.fontMetricId))
+    ? Number(fpIn.fontMetricId)
+    : fontMetricMarkFromSeed(seed);
 
   // Dynamic layer: may change with proxy/exit IP without rebuilding static seeds
   const webrtcAddress = String(
@@ -704,6 +728,14 @@ function buildFingerprint(profile = {}) {
       mode: speechMode,
       voices: speechVoices,
     },
+    fonts: {
+      mode: fontMode,
+      os: fontProfile.os,
+      // Masking needs the full allowed set; 'noise'/'real' keep it for reporting only.
+      installed: fontListOverride || fontProfile.installed,
+      metricMark: fontMetricMark,
+      seededCount: fontProfile.installed.length,
+    },
     maxTouchPoints: Number(fpIn.maxTouchPoints) >= 0 ? Number(fpIn.maxTouchPoints) : 0,
     vendor: fpIn.vendor || 'Google Inc.',
     doNotTrack: privacy.dnt ? '1' : null,
@@ -721,6 +753,9 @@ function buildFingerprint(profile = {}) {
       mediaDevices,
       mediaLabels: mediaLabelTemplates,
       battery,
+      fontMode,
+      fontList: fontListOverride || fontProfile.installed,
+      fontMetricMark,
       webrtcPolicy,
       stability,
       userAgentMetadata: uaProfile.metadata,
@@ -822,6 +857,7 @@ function buildInjectionScript(fp) {
     webgpu: fp.webgpu || null,
     mediaDevices: fp.mediaDevices || null,
     speech: fp.speech || null,
+    fonts: fp.fonts || null,
     maxTouchPoints: fp.maxTouchPoints,
     vendor: fp.vendor || fp.uaProfile?.vendor || 'Google Inc.',
     doNotTrack: fp.doNotTrack,
@@ -856,10 +892,10 @@ function buildInjectionScript(fp) {
   const normalizeHost = (value) => String(value || '')
     .trim()
     .toLowerCase()
-    .replace(/^https?:\/\//, '')
-    .replace(/\/.*$/, '')
-    .replace(/:\d+$/, '')
-    .replace(/^\*\./, '');
+    .replace(/^https?:\\/\\//, '')
+    .replace(/\\/.*$/, '')
+    .replace(/:\\d+$/, '')
+    .replace(/^\\*\\./, '');
   const hostMatches = (host, pattern) => {
     const h = normalizeHost(host);
     const p = normalizeHost(pattern);
@@ -1229,6 +1265,313 @@ function buildInjectionScript(fp) {
     } catch (_) {}
   }
 
+  // --- fonts ---
+  // Masking happens where a font-family value is *set*, not where it is measured.
+  // Stripping masked families makes the engine fall back for real, so offsetWidth /
+  // getBoundingClientRect / measureText all agree — a measurement-patching approach
+  // leaks as soon as a detector cross-checks two of those against each other.
+  if (CFG.fonts && CFG.fonts.mode && CFG.fonts.mode !== 'real') {
+    try {
+      const FCFG = CFG.fonts;
+      const blockAll = FCFG.mode === 'blocked';
+      const maskOn = blockAll || FCFG.mode === 'mask';
+      const metricMark = Number(FCFG.metricMark) || 1;
+      // Sub-pixel, deterministic: same text always measures the same inside a profile.
+      const metricScale = 1 + (((metricMark % 97) + 1) / 1000000);
+
+      const GENERIC = new Set([
+        'serif', 'sans-serif', 'monospace', 'cursive', 'fantasy',
+        'system-ui', 'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded',
+        'math', 'emoji', 'fangsong',
+        'inherit', 'initial', 'unset', 'revert', 'revert-layer', 'default',
+        '-apple-system', 'blinkmacsystemfont',
+      ]);
+      // Resolves to nothing, so the engine performs a genuine default-font fallback.
+      const SENTINEL = '__ob_absent_face__';
+
+      const stripQuotes = (value) => {
+        let s = String(value == null ? '' : value).trim();
+        if (s.length > 1) {
+          const head = s.charAt(0);
+          const tail = s.charAt(s.length - 1);
+          if ((head === '"' && tail === '"') || (head === "'" && tail === "'")) s = s.slice(1, -1);
+        }
+        return s;
+      };
+      const normalizeFamily = (value) => stripQuotes(value).split(/\\s+/).filter(Boolean).join(' ').toLowerCase();
+
+      const allowed = new Set();
+      const list = Array.isArray(FCFG.installed) ? FCFG.installed : [];
+      for (let i = 0; i < list.length; i += 1) allowed.add(normalizeFamily(list[i]));
+
+      // Families declared via @font-face / new FontFace() exist regardless of the
+      // system font set. Masking them would break ordinary sites, so track them.
+      const webFonts = new Set();
+      let sheetScanAt = 0;
+      const rescanSheets = () => {
+        const now = Date.now();
+        if (now - sheetScanAt < 1000) return;
+        sheetScanAt = now;
+        try {
+          const sheets = document.styleSheets || [];
+          for (let i = 0; i < sheets.length; i += 1) {
+            let rules = null;
+            try { rules = sheets[i].cssRules; } catch (_) { continue; } // cross-origin
+            if (!rules) continue;
+            for (let j = 0; j < rules.length; j += 1) {
+              const rule = rules[j];
+              if (rule && rule.type === 5 && rule.style) {
+                const fam = normalizeFamily(rule.style.getPropertyValue('font-family'));
+                if (fam) webFonts.add(fam);
+              }
+            }
+          }
+        } catch (_) {}
+      };
+      try {
+        if (globalThis.FontFace) {
+          const OriginalFontFace = globalThis.FontFace;
+          const PatchedFontFace = function FontFace(family) {
+            try { webFonts.add(normalizeFamily(family)); } catch (_) {}
+            return new OriginalFontFace(...arguments);
+          };
+          PatchedFontFace.prototype = OriginalFontFace.prototype;
+          globalThis.FontFace = nativeLike(PatchedFontFace, OriginalFontFace);
+        }
+      } catch (_) {}
+
+      const familyAllowed = (name) => {
+        const key = normalizeFamily(name);
+        if (!key) return false;
+        if (GENERIC.has(key)) return true;
+        if (webFonts.has(key)) return true;
+        if (!maskOn) return true;
+        if (!blockAll && allowed.has(key)) return true;
+        rescanSheets();
+        return webFonts.has(key);
+      };
+
+      /** Split a font-family list on commas that are not inside quotes. */
+      const splitFamilies = (value) => {
+        const out = [];
+        let buf = '';
+        let quote = '';
+        const src = String(value == null ? '' : value);
+        for (let i = 0; i < src.length; i += 1) {
+          const ch = src.charAt(i);
+          if (quote) {
+            if (ch === quote) quote = '';
+            buf += ch;
+          } else if (ch === '"' || ch === "'") {
+            quote = ch;
+            buf += ch;
+          } else if (ch === ',') {
+            out.push(buf);
+            buf = '';
+          } else {
+            buf += ch;
+          }
+        }
+        if (buf.trim()) out.push(buf);
+        return out;
+      };
+
+      const filterCache = new Map();
+      const filterFamilyList = (value) => {
+        const src = String(value == null ? '' : value);
+        if (!src) return src;
+        if (filterCache.has(src)) return filterCache.get(src);
+        const parts = splitFamilies(src);
+        const kept = [];
+        for (let i = 0; i < parts.length; i += 1) {
+          if (familyAllowed(parts[i])) kept.push(parts[i].trim());
+        }
+        // Everything masked: hand the engine an unresolvable family so it falls back
+        // exactly as it would for a font that is genuinely not installed.
+        const result = kept.length ? kept.join(', ') : SENTINEL;
+        if (filterCache.size < 500) filterCache.set(src, result);
+        return result;
+      };
+
+      /** Font shorthand is [style] [weight] size[/lh] family — family is the tail. */
+      const splitShorthand = (value) => {
+        const src = String(value == null ? '' : value).trim();
+        let i = 0;
+        while (i < src.length) {
+          while (i < src.length && src.charAt(i) === ' ') i += 1;
+          const start = i;
+          while (i < src.length && src.charAt(i) !== ' ') i += 1;
+          const token = src.slice(start, i);
+          const head = token.charAt(0);
+          if (head >= '0' && head <= '9' || head === '.') {
+            return { head: src.slice(0, i), family: src.slice(i).trim() };
+          }
+        }
+        return null;
+      };
+      const filterShorthand = (value) => {
+        const split = splitShorthand(value);
+        if (!split || !split.family) return value;
+        return split.head + ' ' + filterFamilyList(split.family);
+      };
+
+      /** Filter font declarations inside a raw "a: b; c: d" declaration block. */
+      const filterDeclarations = (value) => {
+        const parts = String(value == null ? '' : value).split(';');
+        for (let i = 0; i < parts.length; i += 1) {
+          const colon = parts[i].indexOf(':');
+          if (colon < 0) continue;
+          const key = parts[i].slice(0, colon).trim().toLowerCase();
+          if (key === 'font-family') parts[i] = parts[i].slice(0, colon + 1) + ' ' + filterFamilyList(parts[i].slice(colon + 1));
+          else if (key === 'font') parts[i] = parts[i].slice(0, colon + 1) + ' ' + filterShorthand(parts[i].slice(colon + 1));
+        }
+        return parts.join(';');
+      };
+
+      // 1) CSSStyleDeclaration: fontFamily / font setters, setProperty, cssText
+      try {
+        const proto = globalThis.CSSStyleDeclaration && CSSStyleDeclaration.prototype;
+        if (proto) {
+          const famDesc = Object.getOwnPropertyDescriptor(proto, 'fontFamily');
+          if (famDesc && famDesc.set) {
+            Object.defineProperty(proto, 'fontFamily', {
+              configurable: true,
+              enumerable: famDesc.enumerable,
+              get: famDesc.get,
+              set: nativeLike(function(value) { return famDesc.set.call(this, filterFamilyList(value)); }, famDesc.set),
+            });
+          }
+          const fontDesc = Object.getOwnPropertyDescriptor(proto, 'font');
+          if (fontDesc && fontDesc.set) {
+            Object.defineProperty(proto, 'font', {
+              configurable: true,
+              enumerable: fontDesc.enumerable,
+              get: fontDesc.get,
+              set: nativeLike(function(value) { return fontDesc.set.call(this, filterShorthand(value)); }, fontDesc.set),
+            });
+          }
+          replaceMethod(proto, 'setProperty', (original) => function(name, value, priority) {
+            try {
+              const key = String(name || '').toLowerCase();
+              if (key === 'font-family') return original.call(this, name, filterFamilyList(value), priority);
+              if (key === 'font') return original.call(this, name, filterShorthand(value), priority);
+            } catch (_) {}
+            return original.apply(this, arguments);
+          });
+          // cssText rewrites the whole block and would otherwise bypass the setters.
+          const cssTextDesc = Object.getOwnPropertyDescriptor(proto, 'cssText');
+          if (cssTextDesc && cssTextDesc.set) {
+            Object.defineProperty(proto, 'cssText', {
+              configurable: true,
+              enumerable: cssTextDesc.enumerable,
+              get: cssTextDesc.get,
+              set: nativeLike(function(value) { return cssTextDesc.set.call(this, filterDeclarations(value)); }, cssTextDesc.set),
+            });
+          }
+        }
+      } catch (_) {}
+
+      // 2) Inline style written as an attribute bypasses the setters above.
+      try {
+        replaceMethod(Element.prototype, 'setAttribute', (original) => function(name, value) {
+          try {
+            if (String(name || '').toLowerCase() === 'style' && String(value || '').toLowerCase().indexOf('font') >= 0) {
+              return original.call(this, name, filterDeclarations(value));
+            }
+          } catch (_) {}
+          return original.apply(this, arguments);
+        });
+      } catch (_) {}
+
+      // 3) Canvas: ctx.font drives measureText, the second classic enumeration path.
+      try {
+        const ctxProto = globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
+        if (ctxProto) {
+          const desc = Object.getOwnPropertyDescriptor(ctxProto, 'font');
+          if (desc && desc.set) {
+            Object.defineProperty(ctxProto, 'font', {
+              configurable: true,
+              enumerable: desc.enumerable,
+              get: desc.get,
+              set: nativeLike(function(value) { return desc.set.call(this, filterShorthand(value)); }, desc.set),
+            });
+          }
+          // Per-profile sub-pixel metric drift, applied on top of the masked family.
+          replaceMethod(ctxProto, 'measureText', (original) => function() {
+            const metrics = original.apply(this, arguments);
+            try {
+              const scaled = Object.create(TextMetrics.prototype);
+              const keys = [
+                'width', 'actualBoundingBoxLeft', 'actualBoundingBoxRight',
+                'actualBoundingBoxAscent', 'actualBoundingBoxDescent',
+                'fontBoundingBoxAscent', 'fontBoundingBoxDescent',
+                'emHeightAscent', 'emHeightDescent',
+                'hangingBaseline', 'alphabeticBaseline', 'ideographicBaseline',
+              ];
+              for (let i = 0; i < keys.length; i += 1) {
+                const key = keys[i];
+                const raw = metrics[key];
+                if (typeof raw !== 'number') continue;
+                Object.defineProperty(scaled, key, {
+                  configurable: true, enumerable: true, value: raw * metricScale,
+                });
+              }
+              return scaled;
+            } catch (_) { return metrics; }
+          });
+        }
+      } catch (_) {}
+
+      // 4) FontFaceSet.check() answers the enumeration question directly.
+      try {
+        const setProto = globalThis.FontFaceSet && FontFaceSet.prototype;
+        if (setProto && typeof setProto.check === 'function') {
+          replaceMethod(setProto, 'check', (original) => function(font, text) {
+            try {
+              const split = splitShorthand(font);
+              if (split && split.family) {
+                const parts = splitFamilies(split.family);
+                let any = false;
+                for (let i = 0; i < parts.length; i += 1) if (familyAllowed(parts[i])) any = true;
+                if (!any) return false;
+              }
+            } catch (_) {}
+            return original.apply(this, arguments);
+          });
+        }
+      } catch (_) {}
+
+      // 5) Local Font Access API returns the raw installed list when granted.
+      try {
+        if (typeof globalThis.queryLocalFonts === 'function' || maskOn) {
+          const original = globalThis.queryLocalFonts;
+          const masked = function queryLocalFonts() {
+            if (blockAll) return Promise.resolve([]);
+            try {
+              const out = [];
+              const names = Array.isArray(FCFG.installed) ? FCFG.installed : [];
+              for (let i = 0; i < names.length; i += 1) {
+                const family = String(names[i]);
+                const postscript = family.split(' ').filter(Boolean).join('');
+                out.push({
+                  family: family,
+                  fullName: family,
+                  postscriptName: postscript,
+                  style: 'Regular',
+                });
+              }
+              return Promise.resolve(out);
+            } catch (_) { return Promise.resolve([]); }
+          };
+          Object.defineProperty(globalThis, 'queryLocalFonts', {
+            configurable: true, writable: true,
+            value: original ? nativeLike(masked, original) : masked,
+          });
+        }
+      } catch (_) {}
+    } catch (_) {}
+  }
+
   // --- webrtc ---
   if (CFG.webrtc === 'disabled') {
     try {
@@ -1249,8 +1592,8 @@ function buildInjectionScript(fp) {
               if (!desc || typeof desc.sdp !== 'string' || !targetIp) return desc;
               try {
                 return Object.assign({}, desc, {
-                  sdp: desc.sdp.replace(/(\n)a=candidate:.* typ host .*/g, (line) => {
-                    return line.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/, targetIp);
+                  sdp: desc.sdp.replace(/(\\n)a=candidate:.* typ host .*/g, (line) => {
+                    return line.replace(/\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b/, targetIp);
                   }),
                 });
               } catch (_) { return desc; }
@@ -1810,6 +2153,11 @@ module.exports = {
   clientRectMarkFromSeed,
   resolveStabilityPolicy,
   matchStabilityHost,
+  createFontProfileFromSeed,
+  fontMetricMarkFromSeed,
+  normalizeFontName,
+  isGenericFamily,
+  FONT_POOLS,
   sampleCanvasBlocks,
   hammingDistance,
   applyStableCanvasNoise,
