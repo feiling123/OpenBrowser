@@ -60,6 +60,17 @@ async function closeInstaller(value) {
   if (value.child.exitCode === null) value.child.kill();
 }
 
+/**
+ * Whether a CDP error means the method/domain is simply absent on this kernel
+ * (so the caller should soft-skip, not kill the browser). Chromium builds phrase
+ * this differently — "was not found" / "not available" / "wasn't found"
+ * (Chrome for Testing) — so match the family, not one exact string.
+ */
+function isMissingCdpMethod(message = '') {
+  return /not available|unknown method|(?:was|is|wasn['’]?t|isn['’]?t|not)\s+found|unsupported/i
+    .test(String(message || ''));
+}
+
 async function reconcileOnConnection(connection, desired, managedPaths = []) {
   // OpenBrowser 148 kernels may lack Chrome Extensions.* CDP domain.
   // Probe first; if unavailable, keep browser alive and rely on --load-extension only.
@@ -68,7 +79,7 @@ async function reconcileOnConnection(connection, desired, managedPaths = []) {
     current = await connection.command('Extensions.getExtensions');
   } catch (error) {
     const msg = String(error && error.message || error || '');
-    if (/not available|unknown method|was not found|not found|unsupported/i.test(msg)) {
+    if (isMissingCdpMethod(msg)) {
       return {
         installed: desired.map((item) => ({ ...item, chromeExtensionId: null })),
         extensions: [],
@@ -112,4 +123,4 @@ async function reconcileUnpackedExtensions(browserPath, root, desired, managedPa
   finally { await closeInstaller(installer); }
 }
 
-module.exports = { PipeConnection, launchPipeBrowser, launchInstaller, closeInstaller, reconcileOnConnection, reconcileUnpackedExtensions, portConnection };
+module.exports = { PipeConnection, launchPipeBrowser, launchInstaller, closeInstaller, reconcileOnConnection, reconcileUnpackedExtensions, portConnection, isMissingCdpMethod };

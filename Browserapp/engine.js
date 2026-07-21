@@ -6,7 +6,7 @@ const { pathToFileURL } = require('url');
 const { spawn, execFileSync } = require('child_process');
 const cdp = require('./cdp');
 const { addChromeStoreExtension } = require('./store-extension');
-const { reconcileOnConnection, portConnection } = require('./extension-pipe');
+const { reconcileOnConnection, portConnection, isMissingCdpMethod } = require('./extension-pipe');
 const { parseProxy, displayProxy, startAuthenticatedProxy, lookupProxyCountry, lookupDirectCountry, extractProxyFromApi, invokeProxyRefresh, classifyProxyError } = require('./proxy-forwarder');
 const { resolveProfileLanguage, localeFromCountryCode } = require('./automation/locale-from-country');
 const { mergeLoadExtensionArgs } = require('./automation/protocol/app-center-protocol');
@@ -2110,9 +2110,12 @@ class BrowserEngine {
         });
       }
     } catch (error) {
-      // OpenBrowser 148 kernels may lack Extensions.* CDP — do not kill the browser.
+      // Kernels without the Extensions.* CDP domain (OpenBrowser 148, stock
+      // Chrome for Testing, …) must not kill the browser — extensions still load
+      // via --load-extension. Chromium phrases the missing method differently
+      // ("wasn't found" on CfT), so match the family via isMissingCdpMethod.
       const msg = String(error && error.message || error || '');
-      if (/not available|unknown method|was not found|not found|unsupported/i.test(msg)) {
+      if (isMissingCdpMethod(msg)) {
         reconciled = { installed: extensions, extensions: [], skipped: true, reason: msg };
         this.emit({
           type: 'status',
