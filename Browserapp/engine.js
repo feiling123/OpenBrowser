@@ -1072,6 +1072,32 @@ class BrowserEngine {
     return fp;
   }
 
+  /**
+   * macOS: force the kernel's UI language (which drives Intl's default locale)
+   * to the spoofed language via the app's AppleLanguages/AppleLocale override.
+   * This is macOS's per-app language mechanism; env vars do not affect it there.
+   * Best-effort and synchronous so the preference is on disk before spawn.
+   */
+  applyMacUiLanguage(launchBinary, fingerprint, profile) {
+    const lang = String((fingerprint?.languages && fingerprint.languages[0]) || profile.language || '')
+      .split(',')[0].trim();
+    if (!lang) return;
+    const appleLocale = lang.replace('-', '_');
+    // Resolve the kernel bundle id: .../X.app/Contents/MacOS/bin -> Contents/Info
+    let bundleId = 'org.chromium.Chromium';
+    try {
+      const infoDomain = path.resolve(launchBinary, '../../Info');
+      if (fs.existsSync(infoDomain + '.plist')) {
+        const out = execFileSync('defaults', ['read', infoDomain, 'CFBundleIdentifier'], { encoding: 'utf8', timeout: 4000 }).trim();
+        if (out) bundleId = out;
+      }
+    } catch (_) {}
+    try {
+      execFileSync('defaults', ['write', bundleId, 'AppleLanguages', '-array', lang], { timeout: 4000 });
+      execFileSync('defaults', ['write', bundleId, 'AppleLocale', appleLocale], { timeout: 4000 });
+    } catch (_) {}
+  }
+
   async applyFingerprintToSession(connection, sessionId, item, fingerprint, targetInfo = {}) {
     const profile = item?.profile || {};
     const network = this.networkInfo.get(profile.id) || {};
@@ -2100,10 +2126,16 @@ class BrowserEngine {
     try {
       this.emitStartProgress(profile.id, 'spawn', 62, '正在启动浏览器进程…');
       await ensureKernelReadyForLaunch(browser);
-      // fingerprint-chromium: export LANG/LC_ALL so ICU's default locale (what
-      // Intl.DateTimeFormat reports) matches the spoofed language instead of
-      // leaking the host locale. --lang alone does not cover this.
+      // fingerprint-chromium: align ICU's default locale (what Intl.DateTimeFormat
+      // reports — the "browser UI language") with the spoofed language, so it does
+      // not leak the host locale. --lang does NOT drive this.
+      //  - Linux: ICU reads LANG/LC_ALL (env below).
+      //  - macOS: ICU follows the app's AppleLanguages; env is ignored, so we set
+      //    the per-app language override before launch.
       const spawnEnv = fpChromium ? localeEnvForFingerprintChromium(fingerprint, profile) : null;
+      if (fpChromium && process.platform === 'darwin') {
+        try { this.applyMacUiLanguage(launchBinary, fingerprint, profile); } catch (_) {}
+      }
       child = spawn(launchBinary, finalArgs, {
         detached: process.platform !== 'win32',
         windowsHide: false,
