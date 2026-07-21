@@ -2,7 +2,6 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
-const net = require('net');
 const { pathToFileURL } = require('url');
 const { spawn, execFileSync } = require('child_process');
 const cdp = require('./cdp');
@@ -1149,12 +1148,77 @@ class BrowserEngine {
     return langMode === 'ip' || tzMode === 'ip' || geoMode === 'ip' || geoMode === 'allow';
   }
 
+  // Stable identity of a profile's proxy, so a cached exit is only reused while
+  // the proxy is unchanged. Credentials are included but the value is hashed and
+  // never surfaced.
+  proxyIdentityKey(profile) {
+    const raw = String(profile.proxy || '').trim().toLowerCase();
+    if (!raw || /^(direct|offline|none)$/i.test(raw)) return 'direct';
+    return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32);
+  }
+
+  // How long a cached proxy exit stays usable for locale before a start prefers
+  // to re-detect. Fixed proxies keep the same exit far longer than this; the
+  // window only bounds staleness for rotating gateways.
+  static get EXIT_CACHE_TTL_MS() { return 6 * 60 * 60 * 1000; }
+
+  // Refresh a proxy's exit info without blocking start. Failure is non-fatal:
+  // the cached values already carried the launch, and the next start retries.
+  refreshExitNetworkInBackground(profile) {
+    const id = profile.id;
+    if (this._exitRefreshing?.has(id)) return;
+    if (!this._exitRefreshing) this._exitRefreshing = new Set();
+    this._exitRefreshing.add(id);
+    Promise.resolve()
+      .then(() => this.checkProxy(profile, { allowExtract: false }))
+      .then((network) => {
+        if (!network) return;
+        const stored = this.profiles.get(id) || profile;
+        stored.exitIp = network.ip || stored.exitIp;
+        stored.exitCountryCode = network.countryCode || stored.exitCountryCode;
+        stored.exitTimezone = network.timezone || stored.exitTimezone;
+        stored.exitLatitude = network.latitude ?? stored.exitLatitude;
+        stored.exitLongitude = network.longitude ?? stored.exitLongitude;
+        stored.exitCheckedAt = network.checkedAt || new Date().toISOString();
+        stored.exitProxyKey = this.proxyIdentityKey(stored);
+        this.profiles.set(id, stored);
+      })
+      .catch(() => { /* non-fatal: cached values already launched the profile */ })
+      .finally(() => { this._exitRefreshing.delete(id); });
+  }
+
   async ensureExitNetworkForLocale(profile) {
     if (!this.needsExitNetworkForLocale(profile)) return null;
     let network = this.networkInfo.get(profile.id);
     if (network?.countryCode || network?.ip) return network;
     const proxyRaw = String(profile.proxy || '');
     const isDirect = profile.networkMode === 'direct' || !proxyRaw || /^(direct|offline|none)$/i.test(proxyRaw);
+
+    // Cache-first: a proxied start blocks here on a proxy geo lookup (a 12s race
+    // across four services, up to 3 retries, plus a risk-intel call) purely to
+    // resolve language / timezone / geolocation. When the same proxy was probed
+    // recently, reuse the persisted exit and refresh in the background so the
+    // browser launches immediately instead of waiting on the network round-trip.
+    if (!isDirect && profile.exitCountryCode) {
+      const cachedAt = Date.parse(profile.exitCheckedAt || '');
+      const sameProxy = !profile.exitProxyKey || profile.exitProxyKey === this.proxyIdentityKey(profile);
+      const fresh = Number.isFinite(cachedAt) && (Date.now() - cachedAt) < BrowserEngine.EXIT_CACHE_TTL_MS;
+      if (sameProxy && fresh) {
+        const cached = {
+          ip: profile.exitIp || '',
+          countryCode: profile.exitCountryCode,
+          timezone: profile.exitTimezone || '',
+          latitude: profile.exitLatitude,
+          longitude: profile.exitLongitude,
+          checkedAt: profile.exitCheckedAt,
+          cached: true,
+        };
+        this.networkInfo.set(profile.id, cached);
+        this.refreshExitNetworkInBackground(profile);
+        return cached;
+      }
+    }
+
     try {
       if (!isDirect) {
         network = await this.checkProxy(profile, { allowExtract: false });
@@ -1170,7 +1234,9 @@ class BrowserEngine {
         profile.exitTimezone = network.timezone || profile.exitTimezone;
         profile.exitLatitude = network.latitude ?? profile.exitLatitude;
         profile.exitLongitude = network.longitude ?? profile.exitLongitude;
-        profile.exitCheckedAt = network.checkedAt || profile.exitCheckedAt;
+        profile.exitCheckedAt = network.checkedAt || new Date().toISOString();
+        // Stamp the proxy identity so the next start can trust this cache.
+        if (!isDirect) profile.exitProxyKey = this.proxyIdentityKey(profile);
       }
       return network;
     } catch (error) {
@@ -1831,46 +1897,25 @@ class BrowserEngine {
       else args.push(`--proxy-bypass-list=${bypass}`);
 
       // --- DNS leak containment ---------------------------------------------
-      // A proxied profile must never resolve a name outside the tunnel. Two
-      // separate paths do exactly that if left alone:
+      // The observed leak was Secure DNS (DoH): Chromium opens its own HTTPS
+      // connection to the DoH provider, which does not honour --proxy-server, so
+      // Cloudflare 1.1.1.1 answers from its nearest anycast PoP (Hong Kong here)
+      // while traffic still exits through the proxy. Disabling it removes that
+      // side channel.
       //
-      //  1) Secure DNS (DoH). Chromium opens its own HTTPS connection to the
-      //     DoH provider, which does not honour --proxy-server. Queries egress
-      //     from the provider's network (Cloudflare 1.1.1.1 answers from its
-      //     nearest anycast PoP), so leak tests report that PoP's country while
-      //     traffic still exits through the proxy.
-      //  2) The plain host resolver, used for prefetch and any direct fallback.
+      // Destination names are safe without a resolver rule: Chromium resolves
+      // them through the proxy -- SOCKS5 carries the hostname (ATYP 0x03) and an
+      // HTTP/HTTPS proxy receives CONNECT host:port -- so the host DNS is never
+      // consulted for proxied navigation. --dns-prefetch-disable closes the one
+      // speculative path that would resolve ahead of connecting.
       //
-      // Proxied navigation is unaffected by the resolver rule below: Chromium
-      // hands the hostname to the proxy and never resolves it locally. The rule
-      // only removes the paths that would bypass the tunnel.
-      //
-      // Deliberate trade-off: with direct resolution denied, a dead proxy fails
-      // closed — pages stop loading instead of silently leaking to the host DNS.
-      disabledFeatures.push('DnsOverHttps', 'AsyncDns');
+      // NB: an earlier build added --host-resolver-rules=MAP * ~NOTFOUND to fail
+      // closed. It broke browsing through SOCKS5 entirely -- Chromium consults the
+      // resolver while opening the proxied connection and the deny rule made every
+      // destination unreachable. Removed; disabling DoH is the fix that does not
+      // break the tunnel.
+      disabledFeatures.push('DnsOverHttps');
       args.push('--dns-prefetch-disable');
-
-      // Names that must still resolve locally, or the profile cannot start:
-      // the loopback start page / local API, and the proxy's own hostname.
-      const resolverExcludes = ['localhost', '127.0.0.1'];
-      try {
-        const proxyHost = new URL(proxy).hostname;
-        // An IP literal needs no resolution; a hostname does.
-        if (proxyHost && !net.isIP(proxyHost) && !resolverExcludes.includes(proxyHost)) {
-          resolverExcludes.push(proxyHost);
-        }
-      } catch (_) { /* direct:// and malformed values have no host */ }
-      if (profile.proxyMeta?.directBypass && profile.proxyMeta.bypassList) {
-        // Hosts the user routes around the proxy still need real DNS.
-        for (const entry of String(profile.proxyMeta.bypassList).split(/[\s,;]+/)) {
-          const host = entry.trim().replace(/^\*\./, '');
-          if (host && !resolverExcludes.includes(host)) resolverExcludes.push(host);
-        }
-      }
-      const resolverRule = ['MAP * ~NOTFOUND', ...resolverExcludes.map((h) => `EXCLUDE ${h}`)].join(' , ');
-      const existingResolver = args.findIndex((a) => a.startsWith('--host-resolver-rules='));
-      if (existingResolver >= 0) args[existingResolver] = args[existingResolver] + ' , ' + resolverRule;
-      else args.push(`--host-resolver-rules=${resolverRule}`);
     }
     // Startup URLs: do NOT put the OpenBrowser start page (or first custom URL) on the
     // CLI. The process would paint and run collectFingerprint before CDP inject.
