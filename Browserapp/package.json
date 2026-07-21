@@ -17,6 +17,7 @@
     "selftest:dns": "node automation/dns-leak-containment-selftest.js",
     "selftest:dns-probe": "node automation/dns-leak-probe-path-selftest.js",
     "selftest:wayfern-fp": "node automation/wayfern-fingerprint-selftest.js",
+    "selftest:fpc": "node automation/fingerprint-chromium-selftest.js",
     "selftest:reconcile-skip": "node extension-reconcile-skip-selftest.js",
     "selftest:kernel": "node automation/kernel-policy-selftest.js",
     "selftest:startup": "node browser-startup-diagnostic-selftest.js",

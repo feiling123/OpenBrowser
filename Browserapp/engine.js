@@ -16,6 +16,7 @@ const { buildFingerprint, buildWorkerInjectionScript, chromeArgsForFingerprint, 
 const { acquireProfileLock, releaseProfileLock, auditIsolation, isSystemBrowserExecutable, isPathInsideOrEqual, validateDataRootIsolationSecure, validateProfileRootSecure, assertProfileId, assertSafeProfileChild } = require('./automation/isolation');
 const { BrowserKernelManager, ensureKernelReadyForLaunch, isWayfernKernel } = require('./automation/browser-kernel');
 const { applyWayfernFingerprint } = require('./automation/wayfern-fingerprint');
+const { isFingerprintChromium, chromeArgsForFingerprintChromium, isIdentityFlagToSkip } = require('./automation/fingerprint-chromium');
 const { ensureStartPageServer, getStartPageServer } = require('./automation/start-page-server');
 const {
   isOpenBrowser148,
@@ -216,7 +217,7 @@ class BrowserEngine {
     const list = [];
     // 1) Independent kernel (Donut Wayfern / CfT / custom) — first priority
     const independent = this.kernelManager.resolveInstalled();
-    if (independent) list.push({ name: independent.name, path: independent.path, independent: true, version: independent.version, source: independent.source });
+    if (independent) list.push({ name: independent.name, path: independent.path, independent: true, version: independent.version, source: independent.source, fingerprintChromium: Boolean(independent.fingerprintChromium) });
 
     // 2) System browsers are exposed for explicit manual selection only.
     for (const item of this.systemBrowserCandidates()) list.push({ ...item, independent: false });
@@ -819,6 +820,12 @@ class BrowserEngine {
     if (item?.wayfernKernel) {
       return this.applyWayfernRuntimeSettings(port, enriched, fp, { ...options, phase });
     }
+    // fingerprint-chromium already spoofed everything natively via launch flags.
+    // Injecting anything over CDP would only add detectable JS wrappers, so keep
+    // hands off the fingerprint surfaces (URL blocking is still applied).
+    if (item?.fingerprintChromiumKernel) {
+      return this.applyNativeFlagKernelSettings(port, enriched, fp, { ...options, phase });
+    }
     // Track which CDP page targets already received inject (new tabs must not skip FP)
     const applied = options.appliedTargetIds instanceof Set ? options.appliedTargetIds : new Set();
     const blocked = [];
@@ -1036,6 +1043,32 @@ class BrowserEngine {
     }
     if (options.trackOn) options.trackOn.fingerprint = fp;
     await fpLog('wayfern.inject-end', { phase, profileId: profile.id, applied: Boolean(result?.ok), port });
+    return fp;
+  }
+
+  /**
+   * Runtime settings for a native-flag kernel (fingerprint-chromium): the
+   * fingerprint is already applied via --fingerprint-* launch flags, so we do
+   * NOT touch any fingerprint surface over CDP (that would add detectable JS
+   * wrappers). Only URL blocking — which is orthogonal — is applied.
+   */
+  async applyNativeFlagKernelSettings(port, profile, fp, options = {}) {
+    const phase = String(options.phase || 'native-flag');
+    const tabs = await cdp.tabs(port).catch(() => []);
+    const blocked = [];
+    if (profile.advanced?.blockVideo) blocked.push('*.mp4', '*.webm', '*.m3u8', '*.mov', '*.avi');
+    for (const u of String(profile.advanced?.blockUrls || '').split(/[\n,]+/).map((s) => s.trim()).filter(Boolean).slice(0, 200)) {
+      if (!blocked.includes(u)) blocked.push(u);
+    }
+    if (blocked.length) {
+      for (const tab of tabs) {
+        if (!tab.webSocketDebuggerUrl) continue;
+        await cdp.call(tab.webSocketDebuggerUrl, 'Network.enable').catch(() => {});
+        await cdp.call(tab.webSocketDebuggerUrl, 'Network.setBlockedURLs', { urls: blocked }).catch(() => {});
+      }
+    }
+    if (options.trackOn) options.trackOn.fingerprint = fp;
+    await fpLog('native-flag.inject-skip', { phase, profileId: profile.id, port, reason: 'native --fingerprint-* flags own the fingerprint' });
     return fp;
   }
 
@@ -1901,18 +1934,31 @@ class BrowserEngine {
       '--remote-debugging-port=0',
       '--remote-allow-origins=http://127.0.0.1,http://localhost',
     ];
-    // Fingerprint chrome flags (UA / webrtc / webgl / lang / window-size)
-    // Wayfern owns UA / WebGL / language / screen through its native layer and
-    // IGNORES these flags — worse, a cross-OS `--user-agent` (e.g. a Windows UA
-    // on a macOS host) conflicts with the native platform and can leave
-    // navigator.userAgent blank. Drop the identity flags for Wayfern and let
-    // Wayfern.setFingerprint be the single source of truth; keep the behavioural
-    // ones (anti-automation, WebRTC policy, mute-audio, DNT).
+    // Fingerprint chrome flags (UA / webrtc / webgl / lang / window-size).
+    // Native-fingerprint kernels own these surfaces at the C++ level and must NOT
+    // receive OpenBrowser's identity flags:
+    //  - Wayfern IGNORES them and a cross-OS `--user-agent` can blank the UA;
+    //  - fingerprint-chromium is driven by --fingerprint-* flags instead, and any
+    //    JS/flag override only creates detectable inconsistencies.
     const wayfern = isWayfernKernel(browser);
-    const wayfernSkipFlag = (flag) => /^--(user-agent|lang|window-size|disable-webgl|disable-webgl2|disable-3d-apis)(=|$)/.test(flag);
+    const fpChromium = isFingerprintChromium(browser);
+    const skipIdentityFlag = (flag) => {
+      if (fpChromium) return isIdentityFlagToSkip(flag);
+      if (wayfern) return /^--(user-agent|lang|window-size|disable-webgl|disable-webgl2|disable-3d-apis)(=|$)/.test(flag);
+      return false;
+    };
     for (const flag of chromeArgsForFingerprint(fingerprint, profile)) {
-      if (wayfern && wayfernSkipFlag(flag)) continue;
+      if (skipIdentityFlag(flag)) continue;
       if (!args.some((a) => a.split('=')[0] === flag.split('=')[0])) args.push(flag);
+    }
+    // fingerprint-chromium: pass its native --fingerprint-* flags so UA / Client
+    // Hints / WebGL / platform / timezone are spoofed consistently with NATIVE
+    // getters (no JS wrappers for detectors to catch). CDP/JS inject is skipped
+    // below (item.fingerprintChromiumKernel).
+    if (fpChromium) {
+      for (const flag of chromeArgsForFingerprintChromium(fingerprint, profile)) {
+        if (!args.some((a) => a.split('=')[0] === flag.split('=')[0])) args.push(flag);
+      }
     }
     // openbrowser-148: write profile/init.json so Framework native FP matches buildFingerprint
     let runtimeFingerprint = fingerprint;
@@ -2147,6 +2193,10 @@ class BrowserEngine {
       // addScriptToEvaluateOnNewDocument behind a paid plan, so the standard JS
       // inject is refused. Fingerprint is applied via the Wayfern.* CDP domain.
       wayfernKernel: isWayfernKernel(browser),
+      // fingerprint-chromium spoofs natively via --fingerprint-* launch flags;
+      // OpenBrowser's CDP/JS inject is skipped so navigator/WebGL keep native
+      // getters (JS wrappers are what bot detectors flag).
+      fingerprintChromiumKernel: isFingerprintChromium(browser),
     };
     const cleanup = (exitedNormally = false) => {
       if (item.cleanedUp) return;
@@ -2238,10 +2288,10 @@ class BrowserEngine {
           deviceMemory: fingerprint.deviceMemory,
         };
       }
-      // Wayfern applies fingerprint natively per BrowserContext (inherited by
-      // workers/iframes), and gates Runtime.evaluate — so skip the JS worker
-      // inject, which would only stall every target waiting for the debugger.
-      if (!item.wayfernKernel) {
+      // Native-flag kernels (Wayfern, fingerprint-chromium) already own the
+      // fingerprint for workers/iframes — skip the JS worker inject, which would
+      // only stall targets (Wayfern) or add detectable wrappers (fp-chromium).
+      if (!item.wayfernKernel && !item.fingerprintChromiumKernel) {
         await this.startWorkerFingerprintInjection(item, injectFp).catch(async (error) => {
           item.workerFingerprintError = error.message;
           await fpLog('worker.inject-fail', { profileId: profile.id, error: String(error.message || error) });

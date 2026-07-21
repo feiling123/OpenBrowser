@@ -18,6 +18,7 @@
 
 const fs = require('fs');
 const fsp = require('fs/promises');
+const os = require('os');
 const path = require('path');
 const https = require('https');
 const http = require('http');
@@ -484,6 +485,72 @@ function startupOutput(child) {
     .join(' | ');
 }
 
+/** Read navigator.platform from a page target via a one-shot CDP Runtime.evaluate. */
+function cdpEvalNavigatorPlatform(wsUrl, timeout = 5000) {
+  return new Promise((resolve) => {
+    if (typeof WebSocket !== 'function') { resolve(''); return; }
+    let done = false;
+    const ws = new WebSocket(wsUrl);
+    const finish = (value) => { if (!done) { done = true; try { ws.close(); } catch (_) {} resolve(value); } };
+    ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: 'navigator.platform', returnByValue: true } }));
+    ws.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.id === 1) finish(String(message.result?.result?.value || ''));
+      } catch (_) { finish(''); }
+    };
+    ws.onerror = () => finish('');
+    setTimeout(() => finish(''), timeout);
+  });
+}
+
+/**
+ * Detect a fingerprint-chromium build: launch it headless asking for a
+ * CROSS-host platform via --fingerprint-platform and check whether
+ * navigator.platform actually changed. Ordinary Chromium ignores the flag
+ * (platform stays the host's); fingerprint-chromium honours it. Best-effort:
+ * any failure returns false so a normal custom Chromium is treated as such.
+ */
+async function detectFingerprintChromium(binaryPath) {
+  const resolved = path.resolve(String(binaryPath || ''));
+  if (!resolved || !fs.existsSync(resolved)) return false;
+  const target = process.platform === 'win32' ? 'linux' : 'windows';
+  const want = target === 'windows' ? 'win' : 'linux';
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'openbrowser-fpc-detect-'));
+  let child;
+  try {
+    const args = [
+      '--headless=new',
+      '--disable-gpu',
+      `--user-data-dir=${root}`,
+      '--remote-debugging-port=0',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--fingerprint=1',
+      `--fingerprint-platform=${target}`,
+      'about:blank',
+    ];
+    if (process.getuid && process.getuid() === 0) args.push('--no-sandbox');
+    child = spawn(resolved, args, { stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true });
+    const port = await waitForDevToolsPort(root, 12000);
+    let ws = null;
+    for (let i = 0; i < 20 && !ws; i += 1) {
+      const list = await requestJson(`http://127.0.0.1:${port}/json`).catch(() => null);
+      const page = Array.isArray(list) ? list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl) : null;
+      ws = page ? page.webSocketDebuggerUrl : null;
+      if (!ws) await new Promise((r) => setTimeout(r, 150));
+    }
+    if (!ws) return false;
+    const platform = await cdpEvalNavigatorPlatform(ws);
+    return platform.toLowerCase().includes(want);
+  } catch (_) {
+    return false;
+  } finally {
+    await stopProbeProcess(child).catch(() => {});
+    await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function stopProbeProcess(child) {
   if (!child || child.exitCode !== null) return;
   child.kill('SIGTERM');
@@ -787,6 +854,7 @@ class BrowserKernelManager {
             version: this.meta.version || 'unknown',
             independent: true,
             source: src,
+            fingerprintChromium: Boolean(this.meta.fingerprintChromium),
           };
         }
       }
@@ -1260,8 +1328,11 @@ class BrowserKernelManager {
     this.meta.updatedAt = new Date().toISOString();
     this.meta.platform = donutPlatformKey();
     this.meta.downloadUrl = null;
+    // Detect a fingerprint-chromium build so the engine drives it via native
+    // --fingerprint-* flags (and skips CDP/JS injection, which detectors flag).
+    this.meta.fingerprintChromium = isOpenBrowser ? false : await detectFingerprintChromium(probe.path);
     await this.saveMeta();
-    return { ...this.resolveInstalled(), validation: probe };
+    return { ...this.resolveInstalled(), validation: probe, fingerprintChromium: this.meta.fingerprintChromium };
   }
 
   /** Check remote without downloading. */
@@ -1319,6 +1390,7 @@ module.exports = {
   SOURCE_OPENBROWSER,
   OPENBROWSER_KERNEL_VERSION,
   isWayfernKernel,
+  detectFingerprintChromium,
   termsAcceptanceArgsForKernel,
   ensureKernelReadyForLaunch,
   compareVersions,
