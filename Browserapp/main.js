@@ -30,7 +30,7 @@ app.setPath('userData', userDataRoot);
 const defaultProfileDataRoot = path.join(app.getPath('userData'), 'browser-profiles-v2');
 const localSettingsFile = path.join(app.getPath('userData'), 'openbrowser-local-settings.json');
 
-const UPDATE_REPOSITORY = 'lyu0805/OpenBrowser';
+const UPDATE_REPOSITORY = 'feiling123/OpenBrowser';
 const UPDATE_API_URL = `https://api.github.com/repos/${UPDATE_REPOSITORY}/releases/latest`;
 const UPDATE_LATEST_HTML = `https://github.com/${UPDATE_REPOSITORY}/releases/latest`;
 const UPDATE_RELEASES_ATOM = `https://github.com/${UPDATE_REPOSITORY}/releases.atom`;
