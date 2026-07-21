@@ -1902,7 +1902,16 @@ class BrowserEngine {
       '--remote-allow-origins=http://127.0.0.1,http://localhost',
     ];
     // Fingerprint chrome flags (UA / webrtc / webgl / lang / window-size)
+    // Wayfern owns UA / WebGL / language / screen through its native layer and
+    // IGNORES these flags — worse, a cross-OS `--user-agent` (e.g. a Windows UA
+    // on a macOS host) conflicts with the native platform and can leave
+    // navigator.userAgent blank. Drop the identity flags for Wayfern and let
+    // Wayfern.setFingerprint be the single source of truth; keep the behavioural
+    // ones (anti-automation, WebRTC policy, mute-audio, DNT).
+    const wayfern = isWayfernKernel(browser);
+    const wayfernSkipFlag = (flag) => /^--(user-agent|lang|window-size|disable-webgl|disable-webgl2|disable-3d-apis)(=|$)/.test(flag);
     for (const flag of chromeArgsForFingerprint(fingerprint, profile)) {
+      if (wayfern && wayfernSkipFlag(flag)) continue;
       if (!args.some((a) => a.split('=')[0] === flag.split('=')[0])) args.push(flag);
     }
     // openbrowser-148: write profile/init.json so Framework native FP matches buildFingerprint
