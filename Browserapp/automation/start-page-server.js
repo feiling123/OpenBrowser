@@ -443,12 +443,52 @@ async function fetchJsonUrl(url, { timeout = 12000, headers = {} } = {}) {
   }
 }
 
-async function resolveDnsLeakProbes(testId, count = 12) {
+/**
+ * Trigger the unique probe subdomains through the profile's proxy tunnel so the
+ * EXIT-side resolver queries them — this mirrors what the (proxied) browser does
+ * (SOCKS5 remote DNS / proxy CONNECT resolves the hostname at the exit). A single
+ * local auth bridge is reused for every host; a CONNECT that never completes is
+ * fine — the exit already had to resolve the name to attempt it.
+ */
+async function resolveDnsLeakProbesViaProxy(proxyRaw, hosts, timeout = 3000) {
+  let config;
+  try { config = parseProxy(proxyRaw); } catch (_) { config = null; }
+  if (!config) return false;
+  let bridge;
+  try {
+    bridge = await startAuthenticatedProxy(config);
+    await Promise.all(hosts.map(async (host) => {
+      let socket;
+      try {
+        socket = await connectProxyTunnel(bridge, host, 80, timeout);
+      } catch (_) {
+        /* NXDOMAIN / refused still means the exit resolver looked the name up */
+      } finally {
+        try { socket?.destroy(); } catch (_) {}
+      }
+    }));
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    try { await bridge?.close?.(); } catch (_) {}
+  }
+}
+
+async function resolveDnsLeakProbes(testId, count = 12, proxyRaw = '') {
   const id = String(testId || '').trim();
-  if (!id) return { resolved: 0, hosts: [] };
+  if (!id) return { resolved: 0, hosts: [], via: 'none' };
   const indexes = Array.from({ length: count }, (_, i) => i);
   const hosts = indexes.map((i) => `${i}.${id}.bash.ws`);
-  // Fire unique A lookups so the leak service can observe which resolvers query them.
+  // Proxied profile: resolve through the tunnel so the observed resolver is the
+  // EXIT's, not the host's. Otherwise the host ISP resolver shows up and a clean
+  // (browserleaks-verified) tunnel is misreported as a DNS leak.
+  if (proxyRaw) {
+    const ok = await resolveDnsLeakProbesViaProxy(proxyRaw, hosts);
+    if (ok) return { resolved: hosts.length, hosts, via: 'proxy' };
+    // Fall through to host resolver only if the tunnel could not be established.
+  }
+  // Direct profile (or proxy bridge unavailable): host resolver path.
   // NXDOMAIN / timeout still count as probes that left this machine.
   await Promise.all(hosts.map(async (host) => {
     try {
@@ -458,7 +498,7 @@ async function resolveDnsLeakProbes(testId, count = 12) {
       ]);
     } catch (_) { /* expected for many probes */ }
   }));
-  return { resolved: hosts.length, hosts };
+  return { resolved: hosts.length, hosts, via: 'host' };
 }
 
 function summarizeDnsLeak(rows = [], exitNetwork = null) {
@@ -570,15 +610,20 @@ function summarizeDnsLeak(rows = [], exitNetwork = null) {
 /**
  * DNS leak check:
  * 1) request a unique test id from bash.ws
- * 2) resolve N unique subdomains via local resolver path
+ * 2) resolve N unique subdomains through the EXIT resolver path
  * 3) read which DNS servers the service observed
  * 4) compare DNS countries with current exit IP country
  *
- * For proxy profiles, the probe still uses the host resolver path — this is
- * intentional: it surfaces true DNS leaks when the browser/OS bypasses the proxy.
+ * A proxied profile MUST resolve the probe subdomains through the tunnel — the
+ * browser already does (DoH disabled, SOCKS5 remote DNS / proxy CONNECT), so a
+ * host-resolver probe would observe the host ISP and misreport a clean tunnel as
+ * a leak (the reported false positive on the 127.0.0.1 start page). Only a direct
+ * profile — or a proxy whose local bridge cannot be established — uses the host
+ * resolver, where host == browser resolver and the comparison is meaningful.
  */
 async function lookupDnsLeak(options = {}) {
   const exitNetwork = options.exitNetwork || null;
+  const proxyRaw = String(options.proxy || '');
   const probeCount = Math.min(20, Math.max(8, Number(options.probeCount) || 12));
   try {
     const idProbe = await probeDirect('https://bash.ws/id', 10000, 4096);
@@ -586,7 +631,7 @@ async function lookupDnsLeak(options = {}) {
     if (!/^[A-Za-z0-9_-]{6,64}$/.test(testId)) {
       throw new Error('failed to allocate dns leak test id');
     }
-    await resolveDnsLeakProbes(testId, probeCount);
+    const probe = await resolveDnsLeakProbes(testId, probeCount, proxyRaw);
     await sleep(1200);
     const rows = await fetchJsonUrl(`https://bash.ws/dnsleak/test/${encodeURIComponent(testId)}?json`, {
       timeout: 15000,
@@ -596,6 +641,7 @@ async function lookupDnsLeak(options = {}) {
       ...summary,
       testId,
       provider: 'openbrowser-dns-probe',
+      probePath: probe.via,
     };
   } catch (error) {
     return {
@@ -1158,14 +1204,25 @@ h1{margin:0 0 12px;font-size:20px}p{margin:8px 0;color:#b7becc}code{color:#93c5f
 
     if (pathname === '/api/dns-leak') {
       let exitNetwork = session?.network || null;
+      let proxy = '';
+      const profile = this.engine?.profiles?.get?.(String(pid));
       if (this.engine && pid) {
         exitNetwork = this.engine.networkInfo?.get?.(String(pid)) || exitNetwork;
         if (!exitNetwork) {
           try { exitNetwork = await this.#resolveNetwork(pid, false); } catch (_) {}
         }
+        // Proxied profile: probe through the tunnel so the exit resolver is
+        // observed (matches the browser). Direct profile: host resolver path.
+        if (profile) {
+          const isDirect = profile.networkMode === 'direct'
+            || !profile.proxy
+            || /^(direct|offline|none)$/i.test(String(profile.proxy));
+          if (!isDirect) proxy = String(profile.proxy || '');
+        }
       }
       try {
         const data = await this.lookupDnsLeak({
+          proxy,
           exitNetwork: exitNetwork || {
             ip: session?.exitIp || '',
             countryCode: session?.countryCode || '',
@@ -1178,6 +1235,7 @@ h1{margin:0 0 12px;font-size:20px}p{margin:8px 0;color:#b7becc}code{color:#93c5f
           meta: {
             exitIp: exitNetwork?.ip || session?.exitIp || '',
             exitCountryCode: exitNetwork?.countryCode || session?.countryCode || '',
+            viaProxy: Boolean(proxy),
           },
         });
       } catch (error) {
@@ -1244,5 +1302,7 @@ module.exports = {
   lookupReachability,
   lookupDnsLeak,
   summarizeDnsLeak,
+  resolveDnsLeakProbes,
+  resolveDnsLeakProbesViaProxy,
   DEFAULT_PORT,
 };

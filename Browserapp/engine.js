@@ -14,7 +14,8 @@ const { prepareMarkerExtension, prepareMacDockWrapper, normalizeEnvNumber } = re
 const { toFileUrl, killProcessTree } = require('./automation/protocol/cross-platform');
 const { buildFingerprint, buildWorkerInjectionScript, chromeArgsForFingerprint, applyFingerprintToTab } = require('./automation/fingerprint');
 const { acquireProfileLock, releaseProfileLock, auditIsolation, isSystemBrowserExecutable, isPathInsideOrEqual, validateDataRootIsolationSecure, validateProfileRootSecure, assertProfileId, assertSafeProfileChild } = require('./automation/isolation');
-const { BrowserKernelManager, ensureKernelReadyForLaunch } = require('./automation/browser-kernel');
+const { BrowserKernelManager, ensureKernelReadyForLaunch, isWayfernKernel } = require('./automation/browser-kernel');
+const { applyWayfernFingerprint } = require('./automation/wayfern-fingerprint');
 const { ensureStartPageServer, getStartPageServer } = require('./automation/start-page-server');
 const {
   isOpenBrowser148,
@@ -810,6 +811,14 @@ class BrowserEngine {
       exitLongitude: profile.exitLongitude ?? network.longitude,
     };
     const fp = fingerprint || buildFingerprint(enriched);
+    // Wayfern kernel: standard document-start JS inject / Runtime.evaluate is
+    // refused by the paid-plan gate, and its native layer overrides CDP UA. The
+    // fingerprint is set through the Wayfern.* CDP domain instead. URL blocking
+    // (Network.setBlockedURLs) is still allowed and handled below.
+    const item = this.running.get(profile.id);
+    if (item?.wayfernKernel) {
+      return this.applyWayfernRuntimeSettings(port, enriched, fp, { ...options, phase });
+    }
     // Track which CDP page targets already received inject (new tabs must not skip FP)
     const applied = options.appliedTargetIds instanceof Set ? options.appliedTargetIds : new Set();
     const blocked = [];
@@ -969,6 +978,64 @@ class BrowserEngine {
       options.trackOn.fingerprint = fp;
     }
     await fpLog('inject.end', { phase, profileId: profile.id, applied: applied.size, port });
+    return fp;
+  }
+
+  /**
+   * Fingerprint application for Wayfern kernels: use the native Wayfern.* CDP
+   * domain (the only channel the paid-plan gate honours) instead of JS inject.
+   * Applies per BrowserContext, so one call covers current + future documents.
+   */
+  async applyWayfernRuntimeSettings(port, profile, fp, options = {}) {
+    const phase = String(options.phase || 'wayfern');
+    const tabs = await cdp.tabs(port).catch(() => []);
+    const page = tabs.find((t) => t.webSocketDebuggerUrl);
+    await fpLog('wayfern.inject-begin', {
+      phase,
+      profileId: profile.id,
+      port,
+      tabCount: tabs.length,
+      intended: summarizeFp(fp),
+      logFile: fingerprintLogPath(),
+    });
+    let result = null;
+    if (page) {
+      result = await applyWayfernFingerprint(cdp.call, page.webSocketDebuggerUrl, fp, profile);
+      await fpLog('wayfern.set-fingerprint', { phase, profileId: profile.id, result });
+      if (!result.ok) {
+        this.emit({
+          type: 'fingerprint-injection-failed',
+          id: profile.id,
+          message: 'Wayfern setFingerprint: ' + (result.error || 'unknown'),
+        });
+      } else if (result.crossOsBlocked) {
+        // Same-OS surfaces still applied; OS identity (UA/WebGL) left at host OS.
+        this.emit({
+          type: 'status',
+          action: 'wayfern-cross-os-blocked',
+          id: profile.id,
+          running: true,
+          message: `跨系统指纹（${result.osType} ≠ 本机 ${result.hostOsType}）需要 Wayfern 付费令牌，已仅应用同系统指纹表面。可在环境高级设置填入 wayfernToken。`,
+        });
+      }
+    } else {
+      await fpLog('wayfern.no-tab', { phase, profileId: profile.id, port });
+    }
+    // URL blocking is not gated by Wayfern; apply it directly.
+    const blocked = [];
+    if (profile.advanced?.blockVideo) blocked.push('*.mp4', '*.webm', '*.m3u8', '*.mov', '*.avi');
+    for (const u of String(profile.advanced?.blockUrls || '').split(/[\n,]+/).map((s) => s.trim()).filter(Boolean).slice(0, 200)) {
+      if (!blocked.includes(u)) blocked.push(u);
+    }
+    if (blocked.length) {
+      for (const tab of tabs) {
+        if (!tab.webSocketDebuggerUrl) continue;
+        await cdp.call(tab.webSocketDebuggerUrl, 'Network.enable').catch(() => {});
+        await cdp.call(tab.webSocketDebuggerUrl, 'Network.setBlockedURLs', { urls: blocked }).catch(() => {});
+      }
+    }
+    if (options.trackOn) options.trackOn.fingerprint = fp;
+    await fpLog('wayfern.inject-end', { phase, profileId: profile.id, applied: Boolean(result?.ok), port });
     return fp;
   }
 
@@ -2064,6 +2131,10 @@ class BrowserEngine {
       fingerprint,
       kernelWindowName: kernelWindowName || null,
       nativeKernelFingerprint: isOpenBrowser148(browser),
+      // Wayfern owns fingerprint natively AND gates Runtime.evaluate /
+      // addScriptToEvaluateOnNewDocument behind a paid plan, so the standard JS
+      // inject is refused. Fingerprint is applied via the Wayfern.* CDP domain.
+      wayfernKernel: isWayfernKernel(browser),
     };
     const cleanup = (exitedNormally = false) => {
       if (item.cleanedUp) return;
@@ -2155,11 +2226,16 @@ class BrowserEngine {
           deviceMemory: fingerprint.deviceMemory,
         };
       }
-      await this.startWorkerFingerprintInjection(item, injectFp).catch(async (error) => {
-        item.workerFingerprintError = error.message;
-        await fpLog('worker.inject-fail', { profileId: profile.id, error: String(error.message || error) });
-        this.emit({ type: 'worker-fingerprint-injection-failed', id: profile.id, message: error.message });
-      });
+      // Wayfern applies fingerprint natively per BrowserContext (inherited by
+      // workers/iframes), and gates Runtime.evaluate — so skip the JS worker
+      // inject, which would only stall every target waiting for the debugger.
+      if (!item.wayfernKernel) {
+        await this.startWorkerFingerprintInjection(item, injectFp).catch(async (error) => {
+          item.workerFingerprintError = error.message;
+          await fpLog('worker.inject-fail', { profileId: profile.id, error: String(error.message || error) });
+          this.emit({ type: 'worker-fingerprint-injection-failed', id: profile.id, message: error.message });
+        });
+      }
       // Always open the welcome/start page (even if inject failed).
       if (!restoreSession && startUrl) {
         await fpLog('start.navigate-startpage', { profileId: profile.id, startUrl });
