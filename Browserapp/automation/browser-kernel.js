@@ -1197,7 +1197,13 @@ class BrowserKernelManager {
       const result = await execFileAsync(resolved, ['--version'], { timeout: 8000, windowsHide: true, maxBuffer: 64 * 1024 });
       versionOutput = String(result.stdout || result.stderr || '').trim();
     } catch (error) {
-      throw new Error('无法执行内核版本检查：' + (error.message || error));
+      const msg = String(error.message || error);
+      // Unsigned Chrome for Testing is quarantined by Gatekeeper on first run.
+      const gatekeeper = process.platform === 'darwin'
+        && /killed|SIG|not be opened|Operation not permitted|EACCES|developer cannot be verified/i.test(msg)
+        ? '（macOS 可能因 Gatekeeper 隔离拦截，请在终端执行：xattr -dr com.apple.quarantine "<内核.app 路径>" 后重试）'
+        : '';
+      throw new Error('无法执行内核版本检查：' + msg + gatekeeper);
     }
     if (!/\b(chrome|chromium|wayfern)\b/i.test(versionOutput)) {
       throw new Error('所选文件不是受支持的 Chromium 内核: ' + (versionOutput || '未返回版本信息'));

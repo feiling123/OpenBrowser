@@ -1466,6 +1466,28 @@ app.whenReady().then(async () => {
     applyWindowChrome(win, themeId, colorMode);
     return { success: true, theme: themeId, colorMode };
   });
+  // macOS: a file dialog returns the .app bundle path (a directory), but the
+  // kernel must be the inner Mach-O executable. Resolve .app -> Contents/MacOS/<bin>
+  // so users can just pick "Google Chrome for Testing.app" without drilling in.
+  async function resolveChosenKernelBinary(chosen) {
+    let p = String(chosen || '');
+    if (process.platform === 'darwin') {
+      let isDir = false;
+      try { isDir = (await fsp.stat(p)).isDirectory(); } catch (_) {}
+      if (/\.app$/i.test(p) || isDir) {
+        const macOsDir = path.join(p.replace(/\/$/, ''), 'Contents', 'MacOS');
+        try {
+          const entries = await fsp.readdir(macOsDir);
+          const appName = path.basename(p).replace(/\.app$/i, '');
+          const pick = entries.find((n) => n === appName)
+            || entries.find((n) => n.toLowerCase() === appName.toLowerCase())
+            || entries[0];
+          if (pick) p = path.join(macOsDir, pick);
+        } catch (_) { /* leave as-is; probeBrowserBinary surfaces a clear error */ }
+      }
+    }
+    return p;
+  }
   registerTrustedIpc('kernel:status', () => engine.kernelStatus());
   registerTrustedIpc('kernel:download', async (_event, force) => engine.ensureIndependentKernel(Boolean(force)));
   registerTrustedIpc('kernel:check-update', async () => engine.checkKernelUpdate());
@@ -1473,14 +1495,16 @@ app.whenReady().then(async () => {
   registerTrustedIpc('kernel:policy', async (_event, policy) => engine.setKernelPolicy(policy || {}));
   registerTrustedIpc('kernel:choose-custom', async () => {
     const result = await dialog.showOpenDialog({
-      title: '选择独立 Chromium / Chrome 可执行文件',
-      properties: ['openFile'],
+      title: '选择独立 Chromium / Chrome 可执行文件（macOS 可直接选 .app）',
+      // macOS: allow picking a .app bundle; we resolve its inner binary below.
+      properties: process.platform === 'darwin' ? ['openFile', 'treatPackageAsDirectory'] : ['openFile'],
       filters: process.platform === 'win32'
         ? [{ name: 'Executable', extensions: ['exe'] }]
         : [{ name: 'All', extensions: ['*'] }],
     });
     if (result.canceled || !result.filePaths[0]) return { canceled: true };
-    const kernel = await engine.setCustomKernel(result.filePaths[0]);
+    const binaryPath = await resolveChosenKernelBinary(result.filePaths[0]);
+    const kernel = await engine.setCustomKernel(binaryPath);
     return { canceled: false, kernel };
   });
   registerTrustedIpc('system:get-storage', () => ({ profileRoot: engine.getProfileDataRoot(), defaultProfileRoot: defaultProfileDataRoot, running: engine.running.size }));
