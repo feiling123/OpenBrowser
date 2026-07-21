@@ -16,7 +16,7 @@ const { buildFingerprint, buildWorkerInjectionScript, chromeArgsForFingerprint, 
 const { acquireProfileLock, releaseProfileLock, auditIsolation, isSystemBrowserExecutable, isPathInsideOrEqual, validateDataRootIsolationSecure, validateProfileRootSecure, assertProfileId, assertSafeProfileChild } = require('./automation/isolation');
 const { BrowserKernelManager, ensureKernelReadyForLaunch, isWayfernKernel } = require('./automation/browser-kernel');
 const { applyWayfernFingerprint } = require('./automation/wayfern-fingerprint');
-const { isFingerprintChromium, chromeArgsForFingerprintChromium, isIdentityFlagToSkip } = require('./automation/fingerprint-chromium');
+const { isFingerprintChromium, chromeArgsForFingerprintChromium, isIdentityFlagToSkip, localeEnvForFingerprintChromium } = require('./automation/fingerprint-chromium');
 const { ensureStartPageServer, getStartPageServer } = require('./automation/start-page-server');
 const {
   isOpenBrowser148,
@@ -2100,10 +2100,15 @@ class BrowserEngine {
     try {
       this.emitStartProgress(profile.id, 'spawn', 62, '正在启动浏览器进程…');
       await ensureKernelReadyForLaunch(browser);
+      // fingerprint-chromium: export LANG/LC_ALL so ICU's default locale (what
+      // Intl.DateTimeFormat reports) matches the spoofed language instead of
+      // leaking the host locale. --lang alone does not cover this.
+      const spawnEnv = fpChromium ? localeEnvForFingerprintChromium(fingerprint, profile) : null;
       child = spawn(launchBinary, finalArgs, {
         detached: process.platform !== 'win32',
         windowsHide: false,
         stdio: ['ignore', 'pipe', 'pipe'],
+        ...(spawnEnv ? { env: { ...process.env, ...spawnEnv } } : {}),
       });
       const startupDiagnostic = { launchBinary, profileRoot: root, stdout: '', stderr: '' };
       child._startupDiagnostic = startupDiagnostic;

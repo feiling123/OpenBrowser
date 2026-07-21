@@ -26,6 +26,8 @@ const {
   platformFlagFromFp,
   fingerprintSeed,
   isIdentityFlagToSkip,
+  posixLocale,
+  localeEnvForFingerprintChromium,
 } = require('./fingerprint-chromium');
 const { buildFingerprint } = require('./fingerprint');
 
@@ -75,7 +77,14 @@ function unitTests() {
   assert.strictEqual(isFingerprintChromium({ fingerprintChromium: true }), true, 'meta flag detected');
   assert.strictEqual(isFingerprintChromium({ path: '/x/chrome-for-testing/chrome' }), false, 'CfT not detected');
 
-  console.log('fingerprint-chromium-selftest: unit OK (flag mapping, skip list, seed, platform)');
+  // Locale env (fixes the Intl / Internationalization-API leak).
+  assert.strictEqual(posixLocale('en-US'), 'en_US.UTF-8', 'en-US -> en_US.UTF-8');
+  assert.strictEqual(posixLocale('ja-JP'), 'ja_JP.UTF-8', 'ja-JP -> ja_JP.UTF-8');
+  const env = localeEnvForFingerprintChromium(fp, {});
+  assert.strictEqual(env.LANG, 'ja_JP.UTF-8', 'LANG from primary language');
+  assert.strictEqual(env.LC_ALL, 'ja_JP.UTF-8', 'LC_ALL set');
+
+  console.log('fingerprint-chromium-selftest: unit OK (flag mapping, skip list, seed, platform, locale env)');
 }
 
 async function waitForPort(root, child) {
@@ -118,7 +127,11 @@ async function liveTest(binary) {
   try {
     const args = ['--headless=new', '--disable-gpu', '--disable-dev-shm-usage', `--user-data-dir=${root}`, '--remote-debugging-port=0', '--no-first-run', ...nativeArgs, 'about:blank'];
     if (process.getuid && process.getuid() === 0) args.push('--no-sandbox');
-    child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true });
+    // Simulate a zh-CN host (like the user's Mac); the locale env must override
+    // it so Intl matches the spoofed en-US language.
+    const localeEnv = localeEnvForFingerprintChromium(fp, {});
+    const childEnv = { ...process.env, LANG: 'zh_CN.UTF-8', LC_ALL: 'zh_CN.UTF-8', LANGUAGE: 'zh_CN', ...localeEnv };
+    child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true, env: childEnv });
     const port = await waitForPort(root, child);
     assert.ok(port, 'fingerprint-chromium did not become CDP-ready');
 
@@ -134,7 +147,7 @@ async function liveTest(binary) {
     }
     assert.ok(ws, 'no page target');
 
-    const expr = `JSON.stringify({plat:navigator.platform,wd:String(navigator.webdriver),cores:navigator.hardwareConcurrency,tz:Intl.DateTimeFormat().resolvedOptions().timeZone,ua:navigator.userAgent,platGetter:(''+Object.getOwnPropertyDescriptor(Navigator.prototype,'platform').get)})`;
+    const expr = `JSON.stringify({plat:navigator.platform,wd:String(navigator.webdriver),cores:navigator.hardwareConcurrency,tz:Intl.DateTimeFormat().resolvedOptions().timeZone,intlLocale:Intl.DateTimeFormat().resolvedOptions().locale,navLang:navigator.language,ua:navigator.userAgent,platGetter:(''+Object.getOwnPropertyDescriptor(Navigator.prototype,'platform').get)})`;
     const r = await rpc(ws, 'Runtime.evaluate', { expression: expr, returnByValue: true });
     const v = JSON.parse(r.result.value);
 
@@ -144,8 +157,11 @@ async function liveTest(binary) {
     assert.strictEqual(v.tz, 'America/New_York', 'timezone spoofed');
     assert.ok(v.ua.includes(wantPlat === 'Win32' ? 'Windows' : 'Linux'), 'UA matches target OS');
     assert.ok(/\[native code\]/.test(v.platGetter), 'platform getter is NATIVE (no JS wrapper) — passes navigator spoof detection');
+    // The locale env must win over the simulated zh-CN host so Intl == language.
+    assert.strictEqual(v.navLang, 'en-US', 'navigator.language spoofed');
+    assert.strictEqual(v.intlLocale, 'en-US', `Intl locale aligned with language (got ${v.intlLocale}) — no zh-CN leak`);
 
-    console.log('fingerprint-chromium-selftest: live OK (native cross-OS spoof, native getters, webdriver=false, tz consistent)');
+    console.log('fingerprint-chromium-selftest: live OK (cross-OS spoof, native getters, webdriver=false, tz + Intl locale consistent)');
   } finally {
     if (child && child.exitCode === null) child.kill();
     await fsp.rm(root, { recursive: true, force: true }).catch(() => {});

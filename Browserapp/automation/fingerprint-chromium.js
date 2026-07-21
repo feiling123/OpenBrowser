@@ -110,10 +110,40 @@ function isIdentityFlagToSkip(flag) {
   return /^--(user-agent|lang|window-size|disable-webgl|disable-webgl2|disable-3d-apis|force-webrtc-ip-handling-policy|webrtc-ip-handling-policy)(=|$)/.test(flag);
 }
 
+/** BCP-47 tag (en-US) -> POSIX locale (en_US.UTF-8). */
+function posixLocale(langTag) {
+  const tag = String(langTag || '').trim().split(',')[0].trim();
+  if (!tag) return '';
+  const [lang, region] = tag.split(/[-_]/);
+  if (!lang) return '';
+  const base = region ? `${lang.toLowerCase()}_${region.toUpperCase()}` : lang.toLowerCase();
+  return `${base}.UTF-8`;
+}
+
+/**
+ * Environment overrides for spawning a fingerprint-chromium kernel.
+ *
+ * --lang / --accept-lang set navigator.language(s) and the Accept-Language
+ * header, but NOT the ICU default locale that `Intl.DateTimeFormat().
+ * resolvedOptions().locale` reports — that leaks the HOST locale (e.g. zh-CN on a
+ * Chinese Mac), which detectors flag as "Internationalization API" ≠ language.
+ * ICU reads LANG/LC_ALL, so exporting them to the child aligns Intl with the
+ * spoofed language. Returns null when no language is configured.
+ */
+function localeEnvForFingerprintChromium(fp = {}, profile = {}) {
+  const lang = (Array.isArray(fp.languages) && fp.languages[0]) || profile.language || '';
+  const primary = String(lang).split(',')[0].trim();
+  const loc = posixLocale(primary);
+  if (!loc) return null;
+  return { LANG: loc, LC_ALL: loc, LANGUAGE: primary.replace('-', '_') };
+}
+
 module.exports = {
   isFingerprintChromium,
   chromeArgsForFingerprintChromium,
   platformFlagFromFp,
   fingerprintSeed,
   isIdentityFlagToSkip,
+  posixLocale,
+  localeEnvForFingerprintChromium,
 };
